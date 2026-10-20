@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>golang-sandbox — 在线 Go 运行平台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ======= 顶栏 ======= -->
+<header class="topbar">
+  <div class="logo" aria-hidden="true">Go</div>
+  <span class="brand-name">golang-sandbox</span>
+  <span class="brand-sub">在线 Go 运行平台</span>
+  <div class="top-sp"></div>
+  <span id="goversion-chip" class="go-chip" hidden title="沙箱 Go 版本（由服务端下发）"></span>
+  <span id="capacity" class="cap" aria-label="运行槽位占用">
+    <span class="d"></span><span class="d"></span><span class="d"></span>
+    <span id="queue-chip" class="cap-count">–</span>
+  </span>
+  <button id="info-btn" class="ibtn" type="button" aria-label="隐私说明" aria-expanded="false">
+    <svg class="ic" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+  </button>
+  <div id="info-pop" class="pop" role="dialog" aria-label="隐私说明" hidden>
+    <b>代码仅用于本次运行，平台不留存。</b><br>
+    你提交的代码与标准输入仅用于本次沙箱执行，运行结束即销毁；平台不提供账号、云端保存、分享链接或运行历史。服务端日志仅保留排障所需的最少技术信息（含 trace id）。
+  </div>
+</header>
+
+<!-- ======= 工作区 ======= -->
+<main class="workspace">
+
+  <!-- 编辑器卡片 -->
+  <section class="card editor-card" aria-label="代码编辑器">
+    <div class="card-head">
+      <span class="tab">main.go</span>
+      <span id="save-state" class="save-state" aria-live="polite"></span>
+      <div class="head-sp"></div>
+      <button id="btn-format" class="btn" type="button" title="按 gofmt 风格整理代码">格式化</button>
+      <button id="btn-stdin-toggle" class="btn" type="button" aria-expanded="false" aria-controls="stdin-wrap" aria-label="标准输入">stdin</button>
+    </div>
+
+    <div id="restore-bar" class="dbar" role="status" hidden>
+      <span>检测到上次未保存的草稿<span id="restore-when"></span></span>
+      <span class="dbar-sp"></span>
+      <button id="restore-yes" class="sbtn" type="button">恢复</button>
+      <button id="restore-no" class="sbtn sbtn-ghost" type="button">丢弃</button>
+    </div>
+
+    <div class="editor-wrap">
+      <div class="gutter" id="gutter" aria-hidden="true"></div>
+      <div class="code-stack">
+        <div id="errlayer" class="errlayer" aria-hidden="true"></div>
+        <pre class="code-highlight" id="highlight" aria-hidden="true"><code id="highlight-code"></code></pre>
+        <textarea id="code" class="code-input" spellcheck="false" autocapitalize="off"
+          autocomplete="off" autocorrect="off" wrap="off"
+          aria-label="Go 源代码编辑器"></textarea>
+      </div>
+    </div>
+
+    <div id="stdin-wrap" class="sd" hidden>
+      <div class="sd-l">
+        <span class="sd-t">标准输入（stdin）</span>
+        <span class="sd-h">一次性预填，随代码一起提交（非交互）；留空时程序读输入将立即得到 EOF</span>
+      </div>
+      <textarea id="stdin" spellcheck="false" placeholder="例如：100 20" aria-label="标准输入内容"></textarea>
+    </div>
+
+    <div class="ed-foot">
+      <span id="line-col" class="meta-i">Ln 1, Col 1</span>
+      <span id="code-size" class="meta-i">0 B / 64 KB</span>
+      <span class="fsp"></span>
+      <button id="btn-reset" class="link" type="button" title="恢复为 Hello World 示例">重置示例</button>
+      <span class="kbd">⌘/Ctrl + ↵ 运行</span>
+      <button id="btn-stop" class="btn btn-warn" type="button" hidden>停止</button>
+      <button id="btn-run" class="btn btn-primary" type="button"><span class="btn-run-label">▶ 运行</span></button>
+    </div>
+  </section>
+
+  <!-- 输出卡片 -->
+  <section class="card out-card" aria-label="运行输出">
+    <div class="card-head">
+      <span id="status-chip" class="chip c-ready" role="status" aria-live="polite">就绪</span>
+      <div class="head-sp"></div>
+      <span class="out-meta">
+        <span id="duration-chip" class="meta-chip" hidden></span>
+        <span id="trace-chip" class="meta-chip" hidden></span>
+        <button id="btn-copy" class="ibtn ibtn-sm" type="button" aria-label="复制输出" title="复制输出">
+          <svg class="ic" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+        <button id="btn-clear" class="ibtn ibtn-sm" type="button" aria-label="清空输出" title="清空输出">
+          <svg class="ic" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </span>
+    </div>
+
+    <div class="out-mid">
+      <div id="notice" class="banner-slot" role="status" aria-live="polite" hidden></div>
+      <div id="queue-info" class="banner-slot" role="status" aria-live="polite" hidden></div>
+
+      <div id="out-body" class="out-body">
+        <div id="workline" class="workline" hidden>
+          <span class="spin spin-cyan" aria-hidden="true"></span>
+          <span>正在执行…</span>
+        </div>
+
+        <div id="stdout-section" class="stream-section" hidden>
+          <pre id="stdout" class="stream"></pre>
+        </div>
+        <div id="stderr-section" class="stream-section" hidden>
+          <pre id="stderr" class="stream stream-err"></pre>
+        </div>
+
+        <div id="placeholder" class="empty">
+          <svg class="ic" viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6M12 19h8"/></svg>
+          <p>运行后，程序输出将显示在这里</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ======= 页脚 ======= -->
+<footer class="foot">
+  <span>代码仅用于本次运行，平台不留存</span>
+  <span class="sep">·</span>
+  <a href="#" id="status-page-link" title="状态页于 P1 阶段上线：沙箱可用性 / 队列深度 / 成功率">状态页</a>
+  <span class="sep">·</span>
+  <span id="limits-note">单文件 · 仅 Go 标准库</span>
+</footer>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

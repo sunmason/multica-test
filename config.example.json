@@ -1,0 +1,25 @@
+{
+  "listen": ":8080",
+  "runner": "auto",
+  "docker_image": "golang:1.26-alpine",
+  "trust_proxy": false,
+  "limits": {
+    "max_concurrency": 3,
+    "queue_capacity": 10,
+    "queue_wait_timeout_sec": 30,
+    "exec_timeout_sec": 10,
+    "compile_timeout_sec": 20,
+    "cpu_cores": 1,
+    "memory_mb": 256,
+    "compile_memory_mb": 512,
+    "pids_limit": 64,
+    "output_cap_bytes": 1048576,
+    "tmpfs_mb": 16,
+    "code_max_bytes": 65536,
+    "stdin_max_bytes": 65536
+  },
+  "rate_limit": {
+    "per_source_rpm": 10,
+    "per_source_concurrent": 1
+  }
+}
