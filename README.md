@@ -5,10 +5,10 @@
 
 ## 快速开始
 
-前置：Go 1.26+、Docker（生产路径）。
+前置：Go 1.27+、Docker（生产路径）。
 
 ```bash
-make pull    # 拉取沙箱工具链镜像 golang:1.26-alpine
+make pull    # 拉取沙箱工具链镜像 golang:1.27-alpine
 make build   # 编译到 bin/server
 make run     # 监听 :8080（GSB_LISTEN 可改）
 ```

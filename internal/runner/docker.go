@@ -301,6 +301,7 @@ func (d *Docker) compileCommand(ctx context.Context, id string) *exec.Cmd {
 		"--security-opt", "no-new-privileges",
 		"-e", "CGO_ENABLED=0",
 		"-e", "GOCACHE=/gocache",
+		"-e", "GOTMPDIR=/out", // cold stdlib builds exceed the 16MB /tmp tmpfs
 		"-e", "HOME=/tmp",
 		"-v", cacheVolume + ":/gocache",
 		"-v", outVolumePrefix + id + ":/out",

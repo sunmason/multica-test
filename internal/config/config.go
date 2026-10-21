@@ -58,7 +58,7 @@ func Default() Config {
 	return Config{
 		Listen:      ":8080",
 		Runner:      "auto",
-		DockerImage: "golang:1.26-alpine",
+		DockerImage: "golang:1.27-alpine",
 		TrustProxy:  false,
 		Limits: Limits{
 			MaxConcurrency:      3,

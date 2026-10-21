@@ -17,7 +17,7 @@ run: build
 
 # Pull the toolchain image used by the docker runner (first setup only).
 pull:
-	docker pull golang:1.26-alpine
+	docker pull golang:1.27-alpine
 
 smoke: build pull
 	GSB_LISTEN=:8080 ./bin/server

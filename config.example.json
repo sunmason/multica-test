@@ -1,7 +1,7 @@
 {
-  "listen": ":8080",
+  "listen": ":9080",
   "runner": "auto",
-  "docker_image": "golang:1.26-alpine",
+  "docker_image": "golang:1.27-alpine",
   "trust_proxy": false,
   "limits": {
     "max_concurrency": 3,
