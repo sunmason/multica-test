@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"golang-sandbox/internal/config"
+	"golang-sandbox/internal/logctx"
 	"golang-sandbox/internal/metrics"
 	"golang-sandbox/internal/runner"
 	"golang-sandbox/internal/sched"
@@ -26,26 +27,29 @@ func main() {
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(log)
+	ctx := logctx.WithLogger(logctx.WithTraceID(context.Background(), logctx.NewID()), log)
+	ctx, cancelLifecycle := context.WithCancel(ctx)
+	defer cancelLifecycle()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Error("config load failed", "err", err)
+		logctx.Logger(ctx).ErrorContext(ctx, "config load failed", "err", err)
 		os.Exit(1)
 	}
 
 	reg := metrics.New()
-	r, err := runner.Select(context.Background(), cfg)
+	r, err := runner.Select(ctx, cfg)
 	if err != nil {
-		log.Error("no usable runner", "err", err)
+		logctx.Logger(ctx).ErrorContext(ctx, "no usable runner", "err", err)
 		os.Exit(1)
 	}
 	cfg.Runner = r.Name() // health/meta must report the ACTIVE backend, not the requested one
-	log.Info("runner selected", "runner", r.Name(), "image", cfg.DockerImage)
+	logctx.Logger(ctx).InfoContext(ctx, "runner selected", "runner", r.Name(), "image", cfg.DockerImage)
 
 	sch := sched.New(cfg, r, reg, log)
 	api := server.New(cfg, sch, reg, log)
-	sch.Start()
-	api.StartGoVersionRefresh(context.Background(), r)
+	sch.Start(ctx)
+	api.StartGoVersionRefresh(ctx, r)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -58,20 +62,27 @@ func main() {
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-stop
-		log.Info("shutting down")
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		logctx.Logger(ctx).InfoContext(ctx, "shutting down")
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 25*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
-		sch.Shutdown()
+		if err := srv.Shutdown(ctx); err != nil {
+			logctx.Logger(ctx).WarnContext(ctx, "HTTP shutdown failed", "err", err)
+		}
+		// HTTP draining must not consume the sandbox teardown budget.
+		sch.Shutdown(context.WithoutCancel(ctx))
+		cancelLifecycle()
 	}()
 
-	log.Info("golang-sandbox listening", "addr", cfg.Listen, "runner", r.Name())
+	logctx.Logger(ctx).InfoContext(ctx, "golang-sandbox listening", "addr", cfg.Listen, "runner", r.Name())
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Error("server failed", "err", err)
-		sch.Shutdown()
+		logctx.Logger(ctx).ErrorContext(ctx, "server failed", "err", err)
+		sch.Shutdown(ctx)
 		os.Exit(1)
 	}
-	log.Info("bye")
+	<-shutdownDone
+	logctx.Logger(ctx).InfoContext(ctx, "bye")
 }

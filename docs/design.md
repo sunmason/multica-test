@@ -71,6 +71,11 @@ Docker 不可用时自动回退（`runner: "auto"`）：宿主机进程执行，
 ## 七、观测与运维（E1/E2）
 
 - 结构化 JSON 日志：每次运行含 `run_id`（即 trace id）、来源、状态、耗时、排队时长、截断字节数、退出码、runner。
+- 服务日志统一通过 `internal/logctx` 从 `context.Context` 读取 `trace_id`，使用 `InfoContext` / `WarnContext` / `ErrorContext`，保留注入的 logger。运行日志原有 `run_id` 字段保留，且 `trace_id == run_id`；提交成功的 HTTP access log、排队后执行、轮询与取消均关联该运行 ID。校验失败/拒绝、格式化、健康检查等请求各有服务端生成的独立 ID；不读取外部 trace header，不改变 HTTP JSON 或前端。
+- `run stopped` 记录取消/排队超时等业务终态；`run finished` 表示执行器已经返回（包含其清理）。其中 `status` 始终为 Record 保存的最终业务终态，`runner_status` 单独保留执行器返回的状态。若取消先保存终态而执行器稍后返回 success，两条日志的 `status` 均为 cancelled，完成事件额外记录 `runner_status: success`，耗时/退出码等执行信息仍保留；不改变轮询或终态决策。
+- `Scheduler.Submit/Get/Cancel/Stats/Start/Shutdown` 的首参数为 ctx，HTTP 层传入请求 ctx；Runner 原有 ctx 接口继续贯通至编译、执行及 Docker 管理命令。Record/限流器/指标等纯数据操作、纯函数和标准库约定的 HTTP handler 接口不机械加参。
+- 提交被接收后，调度器用 `context.WithoutCancel` 保留调用方值、移除请求取消和 deadline，再建立每个任务独立的 cancel。排队任务保存自己的 ctx，出队时使用该 ctx；HTTP 返回 202、连接断开或请求 deadline 均不取消已接收任务。取消、排队超时、编译/执行超时、Shutdown 继续独立生效；终态移除任务 ctx/cancel 并停止排队定时器，轮询记录不保存 ctx。任务注册、出队、超时和停机以同一锁协调，避免丢失取消或停机后新增执行。
+- main 的启动/清扫/warmup/停机共享进程生命周期 ctx 和独立 ID；Shutdown 等待 warmup 与执行清理（受调用方 ctx 及原 20s 上限约束）。Go 版本刷新使用该生命周期 ctx。Docker 清理及 OOM 检查脱离任务取消但保留 ctx 值，维持原清理行为；用户程序 stdout/stderr 不作为服务日志改写。
 - `/metrics`：`gosandbox_runs_total{status}`、`gosandbox_rejections_total{reason}`、运行耗时/排队时长直方图、队列深度/运行数 gauge。
 - 告警接入：对 `runs_total{timeout|memory_exceeded}` 增速、`queue_depth` 持续 > 5、`rejections_total` 增速配置阈值告警即可（由监控系统实施）。
 

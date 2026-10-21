@@ -1,6 +1,7 @@
 package sched
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"strings"
@@ -42,6 +43,7 @@ func testSetup(t *testing.T, mutate func(*config.Config)) (*Scheduler, *metrics.
 	}
 	m := metrics.New()
 	s := New(cfg, r, m, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
 	return s, m
 }
 
@@ -59,7 +61,7 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) 
 
 func TestSubmitRunsImmediatelyWithFreeSlot(t *testing.T) {
 	s, _ := testSetup(t, nil)
-	rec, reason, ok := s.Submit("ip1", run.Request{Code: "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"ok\") }\n"})
+	rec, reason, ok := s.Submit(context.Background(), "ip1", run.Request{Code: "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"ok\") }\n"})
 	if !ok {
 		t.Fatalf("rejected: %s", reason)
 	}
@@ -76,15 +78,15 @@ func TestSubmitRunsImmediatelyWithFreeSlot(t *testing.T) {
 func TestQueueThenDequeueOnSlotRelease(t *testing.T) {
 	// Queue wait must outlast the blockers so this tests dequeue, not timeout.
 	s, _ := testSetup(t, func(c *config.Config) { c.Limits.QueueWaitTimeoutSec = 30; c.QueueWait = 30 * time.Second })
-	b1, _, ok1 := s.Submit("ip1", run.Request{Code: sleeperSrc})
-	b2, _, ok2 := s.Submit("ip2", run.Request{Code: sleeperSrc})
+	b1, _, ok1 := s.Submit(context.Background(), "ip1", run.Request{Code: sleeperSrc})
+	b2, _, ok2 := s.Submit(context.Background(), "ip2", run.Request{Code: sleeperSrc})
 	if !ok1 || !ok2 {
 		t.Fatalf("blockers rejected: %v %v", ok1, ok2)
 	}
 	waitFor(t, 5*time.Second, func() bool { return b1.Status() == run.StatusRunning && b2.Status() == run.StatusRunning },
 		"blockers never started")
 
-	q1, _, ok3 := s.Submit("ip3", run.Request{Code: "package main\n\nfunc main() {}\n"})
+	q1, _, ok3 := s.Submit(context.Background(), "ip3", run.Request{Code: "package main\n\nfunc main() {}\n"})
 	if !ok3 || q1.Status() != run.StatusQueued {
 		t.Fatalf("expected queued, got ok=%v status=%s", ok3, q1.Status())
 	}
@@ -94,12 +96,12 @@ func TestQueueThenDequeueOnSlotRelease(t *testing.T) {
 	}
 
 	// Free one slot; the queued run must take it and finish.
-	s.Cancel(b1.ID)
+	s.Cancel(context.Background(), b1.ID)
 	waitFor(t, 20*time.Second, func() bool {
 		st, _, _, res := q1.Snapshot()
 		return st.Terminal() && res != nil && res.Status == run.StatusSuccess
 	}, "queued run never dequeued/finished")
-	s.Cancel(b2.ID)
+	s.Cancel(context.Background(), b2.ID)
 }
 
 func TestQueueFullIsRejected(t *testing.T) {
@@ -109,14 +111,14 @@ func TestQueueFullIsRejected(t *testing.T) {
 		c.QueueWait = 30 * time.Second
 	})
 	for _, ip := range []string{"a", "b"} {
-		if _, _, ok := s.Submit(ip, run.Request{Code: sleeperSrc}); !ok {
+		if _, _, ok := s.Submit(context.Background(), ip, run.Request{Code: sleeperSrc}); !ok {
 			t.Fatalf("blocker for %s rejected", ip)
 		}
 	}
-	if _, _, ok := s.Submit("c", run.Request{Code: sleeperSrc}); !ok {
+	if _, _, ok := s.Submit(context.Background(), "c", run.Request{Code: sleeperSrc}); !ok {
 		t.Fatal("first queued run should fit")
 	}
-	_, reason, ok := s.Submit("d", run.Request{Code: sleeperSrc})
+	_, reason, ok := s.Submit(context.Background(), "d", run.Request{Code: sleeperSrc})
 	if ok || reason != RejectQueueFull {
 		t.Errorf("expected queue_full rejection, got ok=%v reason=%s", ok, reason)
 	}
@@ -124,36 +126,36 @@ func TestQueueFullIsRejected(t *testing.T) {
 
 func TestQueueWaitTimeout(t *testing.T) {
 	s, _ := testSetup(t, nil)
-	b1, _, _ := s.Submit("a", run.Request{Code: sleeperSrc})
-	b2, _, _ := s.Submit("b", run.Request{Code: sleeperSrc})
+	b1, _, _ := s.Submit(context.Background(), "a", run.Request{Code: sleeperSrc})
+	b2, _, _ := s.Submit(context.Background(), "b", run.Request{Code: sleeperSrc})
 	if b1.Status() != run.StatusRunning || b2.Status() != run.StatusRunning {
 		t.Fatal("blockers not running")
 	}
-	q, _, ok := s.Submit("c", run.Request{Code: sleeperSrc})
+	q, _, ok := s.Submit(context.Background(), "c", run.Request{Code: sleeperSrc})
 	if !ok || q.Status() != run.StatusQueued {
 		t.Fatalf("expected queued, got ok=%v status=%s", ok, q.Status())
 	}
 	waitFor(t, 6*time.Second, func() bool { return q.Status() == run.StatusQueueTimeout },
 		"queue timeout never fired")
-	s.Cancel(b1.ID)
-	s.Cancel(b2.ID)
+	s.Cancel(context.Background(), b1.ID)
+	s.Cancel(context.Background(), b2.ID)
 }
 
 func TestCancelRunningReleasesSlot(t *testing.T) {
 	s, _ := testSetup(t, nil)
-	b, _, ok := s.Submit("a", run.Request{Code: sleeperSrc})
+	b, _, ok := s.Submit(context.Background(), "a", run.Request{Code: sleeperSrc})
 	if !ok {
 		t.Fatal("blocker rejected")
 	}
 	waitFor(t, 5*time.Second, func() bool { return b.Status() == run.StatusRunning }, "blocker never started")
 
-	if !s.Cancel(b.ID) {
+	if !s.Cancel(context.Background(), b.ID) {
 		t.Fatal("Cancel returned false for a running run")
 	}
 	waitFor(t, 10*time.Second, func() bool { return b.Status() == run.StatusCancelled }, "cancel never landed")
 
 	// Slot must be free: a new run goes straight to running, not queued.
-	n, _, ok := s.Submit("z", run.Request{Code: "package main\n\nfunc main() {}\n"})
+	n, _, ok := s.Submit(context.Background(), "z", run.Request{Code: "package main\n\nfunc main() {}\n"})
 	if !ok {
 		t.Fatal("follow-up run rejected")
 	}
@@ -165,36 +167,36 @@ func TestCancelRunningReleasesSlot(t *testing.T) {
 
 func TestCancelQueued(t *testing.T) {
 	s, _ := testSetup(t, nil)
-	b1, _, _ := s.Submit("a", run.Request{Code: sleeperSrc})
-	b2, _, _ := s.Submit("b", run.Request{Code: sleeperSrc})
+	b1, _, _ := s.Submit(context.Background(), "a", run.Request{Code: sleeperSrc})
+	b2, _, _ := s.Submit(context.Background(), "b", run.Request{Code: sleeperSrc})
 	waitFor(t, 5*time.Second, func() bool { return b1.Status() == run.StatusRunning && b2.Status() == run.StatusRunning },
 		"blockers never started")
-	q, _, ok := s.Submit("c", run.Request{Code: sleeperSrc})
+	q, _, ok := s.Submit(context.Background(), "c", run.Request{Code: sleeperSrc})
 	if !ok {
 		t.Fatal("queue submission failed")
 	}
-	if !s.Cancel(q.ID) {
+	if !s.Cancel(context.Background(), q.ID) {
 		t.Fatal("Cancel returned false for queued run")
 	}
 	if q.Status() != run.StatusCancelled {
 		t.Errorf("status = %s, want cancelled", q.Status())
 	}
-	s.Cancel(b1.ID)
-	s.Cancel(b2.ID)
+	s.Cancel(context.Background(), b1.ID)
+	s.Cancel(context.Background(), b2.ID)
 }
 
 func TestPerSourceRateLimit(t *testing.T) {
 	s, _ := testSetup(t, func(c *config.Config) { c.RateLimit.PerSourceRPM = 1 })
-	r1, _, ok1 := s.Submit("a", run.Request{Code: "package main\n\nfunc main() {}\n"})
+	r1, _, ok1 := s.Submit(context.Background(), "a", run.Request{Code: "package main\n\nfunc main() {}\n"})
 	if !ok1 {
 		t.Fatal("first submit rejected")
 	}
-	_, reason, ok2 := s.Submit("a", run.Request{Code: "package main\n\nfunc main() {}\n"})
+	_, reason, ok2 := s.Submit(context.Background(), "a", run.Request{Code: "package main\n\nfunc main() {}\n"})
 	if ok2 || reason != RejectRateLimited {
 		t.Errorf("expected rate_limited, got ok=%v reason=%s", ok2, reason)
 	}
 	// Different source unaffected.
-	if _, _, ok := s.Submit("b", run.Request{Code: "package main\n\nfunc main() {}\n"}); !ok {
+	if _, _, ok := s.Submit(context.Background(), "b", run.Request{Code: "package main\n\nfunc main() {}\n"}); !ok {
 		t.Error("other source should be allowed")
 	}
 	waitFor(t, 15*time.Second, func() bool { return r1.Status().Terminal() }, "first run never finished")
@@ -206,26 +208,26 @@ func TestPerSourceConcurrencyLimit(t *testing.T) {
 		c.Limits.QueueWaitTimeoutSec = 30
 		c.QueueWait = 30 * time.Second
 	})
-	b, _, ok := s.Submit("a", run.Request{Code: sleeperSrc})
+	b, _, ok := s.Submit(context.Background(), "a", run.Request{Code: sleeperSrc})
 	if !ok {
 		t.Fatal("blocker rejected")
 	}
-	_, reason, ok := s.Submit("a", run.Request{Code: sleeperSrc})
+	_, reason, ok := s.Submit(context.Background(), "a", run.Request{Code: sleeperSrc})
 	if ok || reason != RejectSourceBusy {
 		t.Errorf("expected source_busy, got ok=%v reason=%s", ok, reason)
 	}
-	s.Cancel(b.ID)
+	s.Cancel(context.Background(), b.ID)
 }
 
 func TestCountedMetricsPerTerminalStatus(t *testing.T) {
 	s, m := testSetup(t, nil)
-	rec, _, ok := s.Submit("a", run.Request{Code: "package main\n\nfunc main() {}\n"})
+	rec, _, ok := s.Submit(context.Background(), "a", run.Request{Code: "package main\n\nfunc main() {}\n"})
 	if !ok {
 		t.Fatal("submit rejected")
 	}
 	waitFor(t, 15*time.Second, func() bool { return rec.Status().Terminal() }, "run never finished")
 	waitFor(t, 2*time.Second, func() bool {
-		_, running := s.Stats()
+		_, running := s.Stats(context.Background())
 		return running == 0
 	}, "slot never released")
 	// The render includes the success counter line.

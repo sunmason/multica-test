@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"golang-sandbox/internal/config"
+	"golang-sandbox/internal/logctx"
 	"golang-sandbox/internal/metrics"
 	"golang-sandbox/internal/run"
 	"golang-sandbox/internal/sched"
@@ -142,7 +143,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec, reason, ok := s.sched.Submit(s.sourceIP(r), run.Request{Code: req.Code, Stdin: req.Stdin})
+	rec, reason, ok := s.sched.Submit(r.Context(), s.sourceIP(r), run.Request{Code: req.Code, Stdin: req.Stdin})
 	if !ok {
 		switch reason {
 		case sched.RejectRateLimited:
@@ -154,6 +155,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	s.bindRunTrace(w, r, rec.ID)
 	s.writeJSON(w, http.StatusAccepted, map[string]any{"run_id": rec.ID, "status": rec.Status()})
 }
 
@@ -179,7 +181,8 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_run_id"})
 		return
 	}
-	rec := s.sched.Get(id)
+	r = r.WithContext(s.bindRunTrace(w, r, id))
+	rec := s.sched.Get(r.Context(), id)
 	if rec == nil {
 		s.writeJSON(w, http.StatusNotFound, map[string]any{"error": "run_not_found"})
 		return
@@ -206,12 +209,13 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_run_id"})
 		return
 	}
-	rec := s.sched.Get(id)
+	r = r.WithContext(s.bindRunTrace(w, r, id))
+	rec := s.sched.Get(r.Context(), id)
 	if rec == nil {
 		s.writeJSON(w, http.StatusNotFound, map[string]any{"error": "run_not_found"})
 		return
 	}
-	if !s.sched.Cancel(id) {
+	if !s.sched.Cancel(r.Context(), id) {
 		s.writeJSON(w, http.StatusConflict, map[string]any{"error": "not_cancellable", "status": rec.Status()})
 		return
 	}
@@ -250,7 +254,7 @@ func (s *Server) handleFormat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	queued, running := s.sched.Stats()
+	queued, running := s.sched.Stats(r.Context())
 	ver, _ := s.goVer.Load().(string)
 	state := "ok"
 	if !s.healthy.Load() {
@@ -329,6 +333,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+	ctx    context.Context
 }
 
 func (sr *statusRecorder) WriteHeader(code int) {
@@ -339,9 +344,11 @@ func (sr *statusRecorder) WriteHeader(code int) {
 func (s *Server) accessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		rec := &statusRecorder{ResponseWriter: w, status: 200}
+		ctx := logctx.WithTraceID(logctx.WithLogger(r.Context(), s.log), logctx.NewID())
+		r = r.WithContext(ctx)
+		rec := &statusRecorder{ResponseWriter: w, status: 200, ctx: ctx}
 		next.ServeHTTP(rec, r)
-		slog.Info("http",
+		logctx.Logger(rec.ctx).InfoContext(rec.ctx, "http",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,
@@ -349,6 +356,17 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 			"source", s.sourceIP(r),
 		)
 	})
+}
+
+// bindRunTrace updates the access-log context after admission/ID validation.
+// The response recorder stays on the synchronous HTTP call stack; async
+// workers receive their own context and never retain the response writer.
+func (s *Server) bindRunTrace(w http.ResponseWriter, r *http.Request, id string) context.Context {
+	ctx := logctx.WithTraceID(r.Context(), id)
+	if rec, ok := w.(*statusRecorder); ok {
+		rec.ctx = ctx
+	}
+	return ctx
 }
 
 func briefError(err error) string {

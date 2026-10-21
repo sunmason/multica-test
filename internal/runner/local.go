@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"golang-sandbox/internal/config"
+	"golang-sandbox/internal/logctx"
 	"golang-sandbox/internal/run"
 )
 
@@ -61,7 +62,7 @@ func (l *Local) Warmup(ctx context.Context) {
 		Code: "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"warmup\") }\n",
 	})
 	if res.Status == run.StatusSuccess {
-		fmt.Printf("[runner] local build cache warmed in %s\n", time.Since(start).Round(time.Millisecond))
+		logctx.Logger(ctx).InfoContext(ctx, "local build cache warmed", "duration_ms", time.Since(start).Milliseconds())
 	}
 }
 

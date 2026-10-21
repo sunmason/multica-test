@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"golang-sandbox/internal/config"
+	"golang-sandbox/internal/logctx"
 	"golang-sandbox/internal/run"
 )
 
@@ -93,9 +94,9 @@ func (d *Docker) Warmup(ctx context.Context) {
 		Code: "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"warmup\") }\n",
 	})
 	if res.Status == run.StatusSuccess {
-		fmt.Printf("[runner] docker build cache warmed in %s\n", time.Since(start).Round(time.Millisecond))
+		logctx.Logger(ctx).InfoContext(ctx, "docker build cache warmed", "duration_ms", time.Since(start).Milliseconds())
 	} else {
-		fmt.Printf("[runner] docker warmup failed: status=%s reason=%s\n", res.Status, res.Reason)
+		logctx.Logger(ctx).WarnContext(ctx, "docker warmup failed", "status", res.Status, "reason", res.Reason)
 	}
 }
 
@@ -157,9 +158,9 @@ func (d *Docker) Execute(ctx context.Context, id string, req run.Request) *run.R
 	start := time.Now()
 
 	// Lifecycle: volume removed last, run container next, compile first.
-	defer func() { _, _ = d.dockerExec(context.Background(), "volume", "rm", outVolumePrefix+id) }()
-	defer func() { _, _ = d.dockerExec(context.Background(), "rm", "-f", runContainerPrefix+id) }()
-	defer func() { _, _ = d.dockerExec(context.Background(), "rm", "-f", compileContainerPrefix+id) }()
+	defer func() { _, _ = d.dockerExec(context.WithoutCancel(ctx), "volume", "rm", outVolumePrefix+id) }()
+	defer func() { _, _ = d.dockerExec(context.WithoutCancel(ctx), "rm", "-f", runContainerPrefix+id) }()
+	defer func() { _, _ = d.dockerExec(context.WithoutCancel(ctx), "rm", "-f", compileContainerPrefix+id) }()
 
 	vctx, vcancel := context.WithTimeout(ctx, dockerOpTimeout)
 	_, err := d.dockerExec(vctx, "volume", "create", outVolumePrefix+id)
@@ -227,7 +228,7 @@ func (d *Docker) Execute(ctx context.Context, id string, req run.Request) *run.R
 
 	exitCode := exitCodeOf(rCmd, runErr)
 	// Inspect before removal to learn whether the kernel OOM-killed the run.
-	oom := d.inspectOOM(context.Background(), runContainerPrefix+id)
+	oom := d.inspectOOM(context.WithoutCancel(ctx), runContainerPrefix+id)
 
 	res := &run.Result{
 		Stdout:     rStdout.String(),

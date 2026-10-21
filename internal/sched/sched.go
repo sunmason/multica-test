@@ -6,8 +6,6 @@ package sched
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -15,6 +13,7 @@ import (
 
 	"golang-sandbox/internal/config"
 	"golang-sandbox/internal/limit"
+	"golang-sandbox/internal/logctx"
 	"golang-sandbox/internal/metrics"
 	"golang-sandbox/internal/run"
 	"golang-sandbox/internal/runner"
@@ -50,12 +49,18 @@ type Scheduler struct {
 	ewmaMS float64
 	full   bool // shutdown: refuse new submissions
 
-	cancelMu sync.Mutex
-	cancels  map[string]context.CancelFunc
+	tasks map[string]*task
 
 	sweepCancel context.CancelFunc
 	sweepWG     sync.WaitGroup
 	execWG      sync.WaitGroup
+}
+
+// task owns only live work; terminal records never retain request contexts.
+type task struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	timer  *time.Timer
 }
 
 // New wires a scheduler around the chosen runner.
@@ -69,19 +74,20 @@ func New(cfg config.Config, r runner.Runner, m *metrics.Registry, log *slog.Logg
 		slots:   make(chan struct{}, cfg.Limits.MaxConcurrency),
 		runs:    make(map[string]*run.Record),
 		ewmaMS:  initEstimate,
-		cancels: make(map[string]context.CancelFunc),
+		tasks:   make(map[string]*task),
 	}
 }
 
 // Start launches the initial orphan sweep, the periodic janitor, and the
 // build-cache warmup.
-func (s *Scheduler) Start() {
-	ctx, cancel := context.WithCancel(context.Background())
+func (s *Scheduler) Start(ctx context.Context) {
+	ctx = logctx.WithLogger(ctx, s.log)
+	ctx, cancel := context.WithCancel(ctx)
 	s.sweepCancel = cancel
-	s.sweepWG.Add(2)
+	s.sweepWG.Add(3)
 	go func() {
 		defer s.sweepWG.Done()
-		s.runner.Sweep(ctx) // residue from a previous crashed process
+		s.runner.Sweep(ctx)
 	}()
 	go func() {
 		defer s.sweepWG.Done()
@@ -96,101 +102,101 @@ func (s *Scheduler) Start() {
 			}
 		}
 	}()
-	go s.runner.Warmup(ctx)
+	go func() {
+		defer s.sweepWG.Done()
+		s.runner.Warmup(ctx)
+	}()
 }
 
-// Shutdown stops intake, cancels queued and running work, and waits (bounded)
-// for executors to tear their sandboxes down, so no container outlives the
-// process by more than the sweeper horizon.
-func (s *Scheduler) Shutdown() {
+// Shutdown stops intake before cancelling work. All worker registrations
+// happen under mu, so none can be added after shutdown begins waiting.
+func (s *Scheduler) Shutdown(ctx context.Context) {
+	ctx = logctx.WithLogger(ctx, s.log)
+	s.mu.Lock()
+	s.full = true
+	for _, rec := range s.queue {
+		t := s.tasks[rec.ID]
+		s.finishAs(t.ctx, rec, &run.Result{Status: run.StatusCancelled, Reason: "服务正在重启，本次运行已取消", Runner: s.runner.Name()})
+		s.releaseTaskLocked(rec)
+		s.limiter.Release(rec.SourceIP)
+	}
+	s.queue = nil
+	for _, t := range s.tasks {
+		t.cancel()
+	}
+	s.updateGaugesLocked()
+	s.mu.Unlock()
 	if s.sweepCancel != nil {
 		s.sweepCancel()
 	}
-	s.sweepWG.Wait()
-
-	s.mu.Lock()
-	s.full = true
-	queued := append([]*run.Record(nil), s.queue...)
-	s.queue = nil
-	s.updateGaugesLocked()
-	s.mu.Unlock()
-
-	for _, rec := range queued {
-		s.finishAs(rec, &run.Result{Status: run.StatusCancelled, Reason: "服务正在重启，本次运行已取消", Runner: s.runner.Name()})
-		s.limiter.Release(rec.SourceIP)
-	}
-
-	s.cancelMu.Lock()
-	for _, cancel := range s.cancels {
-		cancel()
-	}
-	s.cancelMu.Unlock()
-
 	done := make(chan struct{})
 	go func() {
+		s.sweepWG.Wait()
 		s.execWG.Wait()
 		close(done)
 	}()
+	timer := time.NewTimer(shutdownWait)
+	defer timer.Stop()
 	select {
 	case <-done:
-	case <-time.After(shutdownWait):
-		s.log.Warn("shutdown: some executions still tearing down", "waited", shutdownWait)
+	case <-ctx.Done():
+		logctx.Logger(ctx).WarnContext(ctx, "shutdown interrupted", "err", ctx.Err())
+	case <-timer.C:
+		logctx.Logger(ctx).WarnContext(ctx, "shutdown: some executions still tearing down", "waited", shutdownWait)
 	}
 }
 
 // Submit admits one run: per-source limits first, then the slot/queue
 // decision from section 五. On rejection the returned reason is one of the
 // Reject* constants.
-func (s *Scheduler) Submit(sourceIP string, req run.Request) (*run.Record, string, bool) {
+func (s *Scheduler) Submit(ctx context.Context, sourceIP string, req run.Request) (*run.Record, string, bool) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.full {
-		s.mu.Unlock()
 		return nil, RejectQueueFull, false
 	}
 	s.purgeExpiredLocked(time.Now())
-	s.mu.Unlock()
-
 	if reason, ok := s.limiter.Allow(sourceIP); !ok {
 		s.metrics.Rejects().Inc(string(reason))
 		return nil, string(reason), false
 	}
-
-	rec := run.NewRecord(newID(), sourceIP, req, time.Now())
-	s.mu.Lock()
-	s.runs[rec.ID] = rec
+	rec := run.NewRecord(logctx.NewID(), sourceIP, req, time.Now())
 	select {
 	case s.slots <- struct{}{}:
 		rec.SetRunning()
-		s.updateGaugesLocked()
-		s.mu.Unlock()
-		s.launch(rec)
-		return rec, "", true
 	default:
 		if len(s.queue) >= s.cfg.Limits.QueueCapacity {
-			delete(s.runs, rec.ID)
-			s.mu.Unlock()
 			s.limiter.Release(sourceIP)
 			s.metrics.Rejects().Inc(RejectQueueFull)
 			return nil, RejectQueueFull, false
 		}
 		s.queue = append(s.queue, rec)
 		rec.SetQueued(len(s.queue), s.estimateLocked(len(s.queue)))
-		s.updateGaugesLocked()
-		s.mu.Unlock()
-		time.AfterFunc(s.cfg.QueueWait, func() { s.queueTimeout(rec) })
-		return rec, "", true
 	}
+	// Acceptance transfers lifetime to the scheduler, preserving values while
+	// detaching the HTTP deadline/cancellation. Cancel and Shutdown own cancel.
+	ctx = logctx.WithTraceID(logctx.WithLogger(context.WithoutCancel(ctx), s.log), rec.ID)
+	ctx, cancel := context.WithCancel(ctx)
+	s.tasks[rec.ID] = &task{ctx: ctx, cancel: cancel}
+	s.runs[rec.ID] = rec
+	if rec.Status() == run.StatusRunning {
+		s.launchLocked(rec)
+	} else {
+		s.tasks[rec.ID].timer = time.AfterFunc(s.cfg.QueueWait, func() { s.queueTimeout(rec) })
+	}
+	s.updateGaugesLocked()
+	return rec, "", true
 }
 
 // Get returns the record for id, or nil.
-func (s *Scheduler) Get(id string) *run.Record {
+func (s *Scheduler) Get(ctx context.Context, id string) *run.Record {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.runs[id]
 }
 
 // Stats returns current queue depth and running count (health/status page).
-func (s *Scheduler) Stats() (queued, running int) {
+func (s *Scheduler) Stats(ctx context.Context) (queued, running int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.queue), len(s.slots)
@@ -198,64 +204,61 @@ func (s *Scheduler) Stats() (queued, running int) {
 
 // Cancel stops a queued or running run and returns whether a cancellation
 // was initiated.
-func (s *Scheduler) Cancel(id string) bool {
-	rec := s.Get(id)
-	if rec == nil {
+func (s *Scheduler) Cancel(ctx context.Context, id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := s.runs[id]
+	if rec == nil || rec.Status().Terminal() {
 		return false
 	}
-	switch rec.Status() {
-	case run.StatusQueued:
-		s.mu.Lock()
+	ctx = logctx.WithTraceID(logctx.WithLogger(ctx, s.log), id)
+	if rec.Status() == run.StatusQueued {
 		s.removeQueuedLocked(rec)
-		s.updateGaugesLocked()
-		s.mu.Unlock()
-		s.finishAs(rec, &run.Result{Status: run.StatusCancelled, Reason: "排队已取消，槽位已释放", Runner: s.runner.Name()})
+		s.finishAs(ctx, rec, &run.Result{Status: run.StatusCancelled, Reason: "排队已取消，槽位已释放", Runner: s.runner.Name()})
+		s.releaseTaskLocked(rec)
 		s.limiter.Release(rec.SourceIP)
-		return true
-	case run.StatusRunning:
-		// Terminal state goes up immediately; the executor's own (partial)
-		// result is discarded, and it still frees the slot after the
-		// container is confirmed dead.
-		s.finishAs(rec, &run.Result{Status: run.StatusCancelled, Reason: "运行已被用户停止", Runner: s.runner.Name()})
-		s.cancelMu.Lock()
-		cancel, ok := s.cancels[id]
-		s.cancelMu.Unlock()
-		if ok {
-			cancel()
-		}
-		return true
-	default:
-		return false
+		s.updateGaugesLocked()
+	} else {
+		s.finishAs(ctx, rec, &run.Result{Status: run.StatusCancelled, Reason: "运行已被用户停止", Runner: s.runner.Name()})
+		s.tasks[id].cancel()
 	}
+	return true
 }
 
-// launch registers the execution context synchronously (so an immediate
-// Cancel can always find the cancel func) and then spawns the executor.
-func (s *Scheduler) launch(rec *run.Record) {
-	ectx, ecancel := context.WithCancel(context.Background())
-	s.cancelMu.Lock()
-	s.cancels[rec.ID] = ecancel
-	s.cancelMu.Unlock()
+// launchLocked registers workers before releasing mu, making immediate
+// cancellation and shutdown safe even before the executor goroutine starts.
+func (s *Scheduler) launchLocked(rec *run.Record) {
+	t := s.tasks[rec.ID]
+	if t.timer != nil {
+		t.timer.Stop()
+		t.timer = nil
+	}
 	s.execWG.Add(1)
 	go func() {
 		defer s.execWG.Done()
-		s.execute(rec, ectx, ecancel)
+		s.execute(t.ctx, rec)
 	}()
 }
 
-// execute runs the sandbox and then releases the slot and pumps the queue.
-func (s *Scheduler) execute(rec *run.Record, ectx context.Context, ecancel context.CancelFunc) {
-	defer func() {
-		s.cancelMu.Lock()
-		delete(s.cancels, rec.ID)
-		s.cancelMu.Unlock()
-		ecancel()
-	}()
+// releaseTaskLocked drops all context/cancel/timer references for completed work.
+func (s *Scheduler) releaseTaskLocked(rec *run.Record) {
+	t := s.tasks[rec.ID]
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+	t.cancel()
+	delete(s.tasks, rec.ID)
+}
 
+// execute runs the sandbox and then releases the slot and pumps the queue.
+func (s *Scheduler) execute(ectx context.Context, rec *run.Record) {
 	// Cancel/shutdown may have landed between slot grant and this goroutine.
 	// Neither of those paths releases the per-source budget (they expected
 	// this executor to), so it is released here exactly once.
 	if rec.Status().Terminal() {
+		s.mu.Lock()
+		s.releaseTaskLocked(rec)
+		s.mu.Unlock()
 		s.limiter.Release(rec.SourceIP)
 		<-s.slots
 		s.pump()
@@ -271,10 +274,13 @@ func (s *Scheduler) execute(rec *run.Record, ectx context.Context, ecancel conte
 	s.metrics.Duration().Observe(string(res.Status), time.Since(started).Seconds())
 	s.limiter.Release(rec.SourceIP)
 
-	slog.Info("run finished",
+	logctx.Logger(ectx).InfoContext(ectx, "run finished",
 		"run_id", rec.ID,
 		"source", rec.SourceIP,
-		"status", res.Status,
+		// Finish may have lost to Cancel: status always reflects the stored
+		// business outcome; runner_status preserves the executor's result.
+		"status", rec.Status(),
+		"runner_status", res.Status,
 		"duration_ms", res.DurationMS,
 		"queue_ms", started.Sub(rec.CreatedAt).Milliseconds(),
 		"truncated", res.Truncated,
@@ -284,6 +290,7 @@ func (s *Scheduler) execute(rec *run.Record, ectx context.Context, ecancel conte
 	)
 
 	s.mu.Lock()
+	s.releaseTaskLocked(rec)
 	if res.DurationMS > 0 {
 		s.ewmaMS = (1-ewmaAlpha)*s.ewmaMS + ewmaAlpha*float64(res.DurationMS)
 	}
@@ -321,35 +328,36 @@ func (s *Scheduler) pump() {
 		}
 		s.refreshPositionsLocked()
 		s.updateGaugesLocked()
+		s.launchLocked(rec)
 		s.mu.Unlock()
-		s.launch(rec)
 	}
 }
 
 // queueTimeout fires when a queued run exceeded its wait budget (D6).
 func (s *Scheduler) queueTimeout(rec *run.Record) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if rec.Status() != run.StatusQueued {
 		return
 	}
-	s.mu.Lock()
 	s.removeQueuedLocked(rec)
 	s.updateGaugesLocked()
-	s.mu.Unlock()
-
 	res := &run.Result{
 		Status: run.StatusQueueTimeout,
 		Reason: fmt.Sprintf("等待执行超过 %d 秒，已自动取消排队，代码仍保留在编辑器中", s.cfg.Limits.QueueWaitTimeoutSec),
 		Runner: s.runner.Name(),
 	}
-	if rec.Finish(res, time.Now()) {
-		s.metrics.Runs().Inc(string(res.Status))
-	}
+	s.finishAs(s.tasks[rec.ID].ctx, rec, res)
+	s.metrics.Runs().Inc(string(res.Status))
+	s.releaseTaskLocked(rec)
 	s.limiter.Release(rec.SourceIP)
 }
 
-// finishAs stores a terminal result if the record is still live.
-func (s *Scheduler) finishAs(rec *run.Record, res *run.Result) {
-	rec.Finish(res, time.Now())
+// finishAs logs only the winning transition, preserving the run correlation.
+func (s *Scheduler) finishAs(ctx context.Context, rec *run.Record, res *run.Result) {
+	if rec.Finish(res, time.Now()) {
+		logctx.Logger(ctx).InfoContext(ctx, "run stopped", "run_id", rec.ID, "status", res.Status)
+	}
 }
 
 func (s *Scheduler) removeQueuedLocked(rec *run.Record) {
@@ -385,12 +393,4 @@ func (s *Scheduler) purgeExpiredLocked(now time.Time) {
 			delete(s.runs, id)
 		}
 	}
-}
-
-func newID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(fmt.Sprintf("sched: entropy unavailable: %v", err))
-	}
-	return hex.EncodeToString(b[:])
 }

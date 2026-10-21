@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -40,7 +41,7 @@ func newTestServer(t *testing.T, mutate func(*config.Config)) (*httptest.Server,
 	sc := sched.New(cfg, r, m, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := New(cfg, sc, m, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ts := httptest.NewServer(srv.Handler())
-	t.Cleanup(ts.Close)
+	t.Cleanup(func() { ts.Close(); sc.Shutdown(context.Background()) })
 	return ts, m
 }
 
